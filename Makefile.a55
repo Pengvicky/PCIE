@@ -1,0 +1,118 @@
+# Makefile — A55 TPCM PCIe Endpoint 驱动 Out-of-Tree 编译
+#
+# 用法：
+#   make KDIR=/path/to/kernel/source        # 指定内核源码路径
+#   make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-  # 交叉编译（A55 目标）
+#   make install                             # insmod 加载模块
+#   make remove                              # rmmod 卸载模块
+#   make clean                               # 清理构建产物
+#
+# 示例（在 x86 主机上交叉编译 ARM64 内核模块）：
+#   make KDIR=/opt/hi1712-kernel \
+#        ARCH=arm64 \
+#        CROSS_COMPILE=aarch64-linux-gnu-
+#
+# 示例（在 A55 板子上本地编译）：
+#   make KDIR=/lib/modules/$(uname -r)/build
+
+# =========================================================
+# 可配置变量（可通过命令行覆盖）
+# =========================================================
+
+# 内核源码/构建目录
+# 优先使用命令行传入的 KDIR，否则使用当前运行内核的构建目录
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+# 当前驱动源码目录（绝对路径，避免内核构建系统切换目录后路径失效）
+PWD := $(shell pwd)
+
+# 模块名称
+MODULE_NAME := a55_tpcm_ep_driver
+
+# =========================================================
+# 内核模块构建目标声明
+# =========================================================
+
+# obj-m 告诉内核构建系统将此目标编译为可加载模块（.ko）
+obj-m := $(MODULE_NAME).o
+
+# 若模块由多个 .c 文件组成，在此列出（当前只有一个源文件）
+# $(MODULE_NAME)-objs := a55_tpcm_ep_driver.o other_file.o
+
+# =========================================================
+# 编译选项
+# =========================================================
+
+# 附加编译警告：将常见错误提升为警告，提高代码质量
+ccflags-y := -Wall -Wextra -Wno-unused-parameter
+
+# 调试模式：取消注释以启用 pr_debug() 输出
+# ccflags-y += -DDEBUG
+
+# =========================================================
+# 构建规则
+# =========================================================
+
+.PHONY: all install remove clean help
+
+# 默认目标：编译内核模块
+all:
+	@echo "[TPCM] 开始编译内核模块: $(MODULE_NAME).ko"
+	@echo "[TPCM] 内核源码目录: $(KDIR)"
+	@echo "[TPCM] 驱动源码目录: $(PWD)"
+	$(MAKE) -C $(KDIR) \
+		M=$(PWD) \
+		ARCH=$(ARCH) \
+		CROSS_COMPILE=$(CROSS_COMPILE) \
+		modules
+	@echo "[TPCM] 编译完成: $(MODULE_NAME).ko"
+
+# 加载模块到内核
+install: all
+	@echo "[TPCM] 加载模块: $(MODULE_NAME).ko"
+	sudo insmod $(MODULE_NAME).ko
+	@echo "[TPCM] 模块已加载，查看日志: dmesg | tail -30"
+
+# 从内核卸载模块
+remove:
+	@echo "[TPCM] 卸载模块: $(MODULE_NAME)"
+	sudo rmmod $(MODULE_NAME) || true
+	@echo "[TPCM] 模块已卸载"
+
+# 查看模块加载后的内核日志
+log:
+	dmesg | grep -E "\[TPCM\]" | tail -50
+
+# 清理所有构建产物
+clean:
+	@echo "[TPCM] 清理构建产物..."
+	$(MAKE) -C $(KDIR) \
+		M=$(PWD) \
+		ARCH=$(ARCH) \
+		CROSS_COMPILE=$(CROSS_COMPILE) \
+		clean
+	@rm -f Module.symvers modules.order
+	@echo "[TPCM] 清理完成"
+
+# 帮助信息
+help:
+	@echo "========================================================"
+	@echo "  A55 TPCM PCIe Endpoint 驱动 Makefile"
+	@echo "========================================================"
+	@echo ""
+	@echo "  目标:"
+	@echo "    all      - 编译内核模块 (默认)"
+	@echo "    install  - 编译并 insmod 加载模块"
+	@echo "    remove   - rmmod 卸载模块"
+	@echo "    log      - 查看 dmesg 中的 TPCM 日志"
+	@echo "    clean    - 清理构建产物"
+	@echo "    help     - 显示此帮助"
+	@echo ""
+	@echo "  变量:"
+	@echo "    KDIR          = $(KDIR)"
+	@echo "    ARCH          = $(ARCH)"
+	@echo "    CROSS_COMPILE = $(CROSS_COMPILE)"
+	@echo ""
+	@echo "  交叉编译示例:"
+	@echo "    make KDIR=/opt/hi1712-kernel ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-"
+	@echo "========================================================"
