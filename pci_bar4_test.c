@@ -65,7 +65,7 @@ int main() {
     // args.is_write = 0;
 
     // Clear the buffer before reading
-    memset(test_buffer, 0, sizeof(test_buffer));
+    memset(test_buffer, 0, 256);  /* sizeof(ptr) would be 8, use explicit size */
 
     if (ioctl(fd, PCI_BAR4_READ, &args) < 0) {
         perror("Read ioctl failed");

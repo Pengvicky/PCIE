@@ -17,10 +17,11 @@ MODULE_DESCRIPTION("PCI driver with BAR4 space access for devices already claime
 #define DEVICE_NAME "pci_bar4_driver"
 #define CLASS_NAME  "pci_bar4"
 
+// Updated per lspci -vvv -s 21:00.7 on Kunpeng 950
 #define TARGET_DOMAIN 0x0000
-#define TARGET_BUS    0x02
-#define TARGET_DEV    0x01
-#define TARGET_FUNC   0x1
+#define TARGET_BUS    0x21
+#define TARGET_DEV    0x00
+#define TARGET_FUNC   0x7
 
 // ioctl command
 // #define PCI_BAR4_ACCESS _IOWR('k', 1, struct bar4_access_args)
@@ -350,7 +351,8 @@ static int __init pci_bar4_init(void)
     // }
 
     // 4. iMap the BAR4 space to virtual memory
-    bar4_mapped = ioremap(bar4_start, bar4_size);
+    // Use ioremap_wc (Write-Combining) for PCIe shared memory to improve throughput
+    bar4_mapped = ioremap_wc(bar4_start, bar4_size);
     if (!bar4_mapped) {
         printk(KERN_ERR "Failed to map BAR4 space\n");
         ret = -ENOMEM;
@@ -374,7 +376,7 @@ static int __init pci_bar4_init(void)
     }
 
     // 7. Create device class
-    pci_bar4_class = class_create(DEVICE_NAME);
+    pci_bar4_class = class_create(THIS_MODULE, DEVICE_NAME);
     if (IS_ERR(pci_bar4_class)) {
         printk(KERN_ERR "Failed to create device class\n");
         ret = PTR_ERR(pci_bar4_class);
@@ -402,7 +404,7 @@ error_cdev:
 error_alloc:
     iounmap(bar4_mapped);
 error_map:
-    release_mem_region(bar4_start, bar4_size);
+    /* request_mem_region is not used (commented out), nothing to release here */
 error_put_pci:
     pci_dev_put(pdev);
     return ret;

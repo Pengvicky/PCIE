@@ -55,8 +55,8 @@
 
 /*
  * 门铃寄存器在 BAR4 内的偏移。
- * Host 写这个偏移 → 触发 A55 IRQ 45。
- * 实际偏移需查 Hi1712 硬件手册，此处为占位值，联调前必须确认。
+ * 当前方案为纯共享内存轮询，无需门铃触发。
+ * 保留此宏以备后续扩展中断模式时使用。
  */
 #define DOORBELL_BAR4_OFFSET    0x10000
 
@@ -249,18 +249,15 @@ static int ring_submit_cmd(uint32_t *head, uint32_t cmd_id,
 }
 
 /**
- * ring_trigger_doorbell() — 敲门铃，触发 A55 IRQ 45
+ * ring_trigger_doorbell() — 占位函数（当前方案无需门铃）
  *
- * 向 BAR4 内的门铃寄存器偏移写入任意值即可触发中断。
- * 具体偏移 DOORBELL_BAR4_OFFSET 需查 Hi1712 硬件手册确认。
+ * 当前通信方式为纯共享内存轮询，A55 侧内核线程主动检查 head 指针。
+ * Host 不需要发送任何中断信号，此函数保留备用。
  */
 static void ring_trigger_doorbell(void)
 {
-    uint32_t val = 1;
-    printf("[HOST] 敲门铃: BAR4 offset=0x%x\n", DOORBELL_BAR4_OFFSET);
-    if (bar4_write_u32(DOORBELL_BAR4_OFFSET, val) < 0) {
-        fprintf(stderr, "[HOST] 警告：门铃写入失败，A55 可能不会收到中断\n");
-    }
+    /* 备用，当前轮询模式无需门铃；若需中断模式可在此写入 BAR4[DOORBELL_BAR4_OFFSET] */
+    (void)DOORBELL_BAR4_OFFSET;  /* 备用，消除 unused 警告 */
 }
 
 /**
@@ -399,9 +396,9 @@ int main(int argc, char *argv[])
         cmd_id++;
     }
 
-    /* ---- 批量投递完成后统一敲一次门铃 ---- */
-    printf("\n[HOST] 所有指令已投递，触发门铃中断通知 A55\n");
-    ring_trigger_doorbell();
+    /* ---- 所有指令投递完成，A55 内核轮询线程会自动检测到新指令 ---- */
+    printf("\n[HOST] 所有指令已投递（纯轮询模式，无需门铃）\n");
+    ring_trigger_doorbell();  /* 当前为空操作，保留接口备用 */
 
     /* ---- 逐条等待结果 ---- */
     printf("\n[HOST] 开始等待 A55 回填度量结果...\n\n");

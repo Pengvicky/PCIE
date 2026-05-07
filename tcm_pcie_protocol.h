@@ -19,16 +19,19 @@
  * ========================================================= */
 
 /* A55 侧 32MB 共享内存物理基址（Inbound ATU 路由目标） */
-#define A55_SHARED_PHYS_BASE        0x8cd00000UL
+/* 实测确认值： A55 本地 DDR 0x8bc00000 */
+#define A55_SHARED_PHYS_BASE        0x8bc00000UL
 
 /* 共享内存总大小：32MB */
 #define A55_SHARED_SIZE             (32 * 1024 * 1024)
 
-/* 920 敲击 A55 触发的硬件门铃中断号 */
-#define A55_DOORBELL_IRQ            45
-
-/* A55 敲击 920 发送 MSI 中断的触发寄存器物理地址 */
-#define A55_MSI_TRIGGER_REG_PHYS    0x1A000040UL
+/*
+ * 通信模式：纯共享内存轮询，无中断
+ *   - Host 写入指令并更新 head 指针
+ *   - A55 内核线程以 TPCM_POLL_INTERVAL_US 间隔轮询 head
+ *   - Host 轮询 status 字段感知完成，无需 MSI 回调
+ */
+#define TPCM_POLL_INTERVAL_US       200   /* A55 轮询间隔（微秒，可通过模块参数覆盖） */
 
 /* =========================================================
  * Ring Buffer 参数
