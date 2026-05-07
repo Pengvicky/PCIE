@@ -26,6 +26,10 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 # 当前驱动源码目录（绝对路径，避免内核构建系统切换目录后路径失效）
 PWD := $(shell pwd)
 
+# 架构：未指定时自动检测当前机器架构（支持本机编译，无需手动传参）
+# 交叉编译时通过命令行覆盖：make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+ARCH ?= $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
+
 # 模块名称
 MODULE_NAME := a55_tpcm_ep_driver
 
@@ -60,11 +64,14 @@ all:
 	@echo "[TPCM] 开始编译内核模块: $(MODULE_NAME).ko"
 	@echo "[TPCM] 内核源码目录: $(KDIR)"
 	@echo "[TPCM] 驱动源码目录: $(PWD)"
+	@echo "obj-m := $(MODULE_NAME).o" > $(PWD)/Kbuild
+	@echo "ccflags-y := -Wall -Wextra -Wno-unused-parameter" >> $(PWD)/Kbuild
 	$(MAKE) -C $(KDIR) \
 		M=$(PWD) \
 		ARCH=$(ARCH) \
 		CROSS_COMPILE=$(CROSS_COMPILE) \
 		modules
+	@rm -f $(PWD)/Kbuild
 	@echo "[TPCM] 编译完成: $(MODULE_NAME).ko"
 
 # 加载模块到内核
@@ -86,11 +93,13 @@ log:
 # 清理所有构建产物
 clean:
 	@echo "[TPCM] 清理构建产物..."
+	@echo "obj-m := $(MODULE_NAME).o" > $(PWD)/Kbuild
 	$(MAKE) -C $(KDIR) \
 		M=$(PWD) \
 		ARCH=$(ARCH) \
 		CROSS_COMPILE=$(CROSS_COMPILE) \
 		clean
+	@rm -f $(PWD)/Kbuild
 	@rm -f Module.symvers modules.order
 	@echo "[TPCM] 清理完成"
 
