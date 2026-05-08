@@ -33,6 +33,7 @@
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/types.h>
+#include <linux/spinlock.h>
 
 #include "tcm_pcie_protocol.h"
 
@@ -83,45 +84,135 @@ struct a55_tpcm_dev {
 static struct a55_tpcm_dev *g_tpcm_dev;
 
 /* =========================================================
- * 度量模拟
+ * 度量后端回调机制
+ *
+ * 原理（Linux EXPORT_SYMBOL 插件模式）：
+ *
+ *   本驱动维护一个函数指针 g_tpcm_backend，初始为 NULL。
+ *   外部模块（tpcm_hw.ko）在自身 init() 里调用
+ *   tpcm_register_backend() 注册真实度量函数；
+ *   本驱动在处理每条指令时判断指针是否非 NULL：
+ *     非 NULL → 调真实 TPCM（tpcm_hw.ko 提供）
+ *     NULL    → 调内置模拟（tpcm_simulate_hash）
+ *
+ * 这样 tpcm_hw.ko 可以独立编译、独立加载/卸载，
+ * 本驱动无需任何修改即可切换真实/模拟两种后端。
+ *
+ * 回调原型：
+ *   int fn(const u8 *data, size_t len, u8 hash_out[32])
+ *   成功返回 0，失败返回负数。
  * ========================================================= */
 
+typedef int (*tpcm_backend_fn_t)(const u8 *data, size_t len, u8 hash_out[32]);
+
+static tpcm_backend_fn_t g_tpcm_backend;          /* 初始为 NULL，即模拟模式 */
+static DEFINE_SPINLOCK(g_backend_lock);            /* 保护函数指针的并发读写 */
+
 /**
- * tpcm_simulate_hash() — 模拟 SHA-256 度量
+ * tpcm_register_backend() — 注册 / 注销真实 TPCM 度量后端
  *
- * 真实部署需替换为：
- *   1. DMA 从 host_phys_addr 搬运数据到本地缓冲
- *   2. 调用 TCM 硬件 SHA-256 引擎
- *   3. 等待硬件完成（轮询状态寄存器或等待硬件中断）
+ * 传入非 NULL 函数指针：注册真实后端，后续度量调真实 TPCM。
+ * 传入 NULL：注销后端，回退到内置模拟模式。
+ *
+ * EXPORT_SYMBOL 使该符号对其他内核模块可见，
+ * tpcm_hw.ko 链接时可直接调用，无需修改本文件。
  */
+void tpcm_register_backend(tpcm_backend_fn_t fn)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&g_backend_lock, flags);
+    g_tpcm_backend = fn;
+    spin_unlock_irqrestore(&g_backend_lock, flags);
+    pr_info("[TPCM] 度量后端%s\n",
+            fn ? "已注册（真实 TPCM 模式）" : "已注销（回退模拟模式）");
+}
+EXPORT_SYMBOL(tpcm_register_backend);
+
+/* =========================================================
+ * DMA 数据区布局（与 tpcm_pcie_client.c 中定义一致）
+ *   BAR4 偏移 0x10000 起，每槽 256KB，共 128 槽
+ * ========================================================= */
+#define DMA_BASE_OFFSET  0x10000UL
+#define DMA_SLOT_SIZE    (256 * 1024UL)
+
+/* =========================================================
+ * 内置模拟后端（无真实后端时使用）
+ * ========================================================= */
 static void tpcm_simulate_hash(struct tcm_measure_cmd __iomem *cmd)
 {
-    __u32 cmd_id;
+    __u32 cmd_id = readl(&cmd->cmd_id);
     __u8  hash_buf[32];
     int   i;
 
-    cmd_id = readl(&cmd->cmd_id);
-
-    pr_info("[TPCM] 开始度量: cmd_id=0x%08x, host_phys=0x%016llx, len=%u\n",
+    pr_info("[TPCM] [模拟] cmd_id=0x%08x host_phys=0x%016llx len=%u\n",
             cmd_id,
             (unsigned long long)readq(&cmd->host_phys_addr),
             (unsigned int)readw(&cmd->payload_len));
-
-    /* 标记为处理中 */
     writeb(TCM_STATUS_PROCESSING, &cmd->status);
-
-    /* 模拟 TCM 硬件度量耗时（2ms） */
     msleep(2);
-
-    /* 生成模拟哈希：用 cmd_id 各字节异或填充（真实场景替换为硬件结果） */
     for (i = 0; i < 32; i++)
         hash_buf[i] = ((__u8)(cmd_id >> ((i % 4) * 8))) ^ ((__u8)i);
-
-    /* 将哈希结果写回共享内存 */
     memcpy_toio(cmd->hash_result32, hash_buf, 32);
-
-    pr_info("[TPCM] 度量完成: cmd_id=0x%08x, hash[0..3]=%02x%02x%02x%02x\n",
+    pr_info("[TPCM] [模拟] 完成: cmd_id=0x%08x hash[0..3]=%02x%02x%02x%02x\n",
             cmd_id, hash_buf[0], hash_buf[1], hash_buf[2], hash_buf[3]);
+}
+
+/* =========================================================
+ * 统一度量入口：判断后端 → 调真实 TPCM 或模拟
+ * ========================================================= */
+static void tpcm_do_measure(struct a55_tpcm_dev *dev,
+                            struct tcm_measure_cmd __iomem *cmd)
+{
+    tpcm_backend_fn_t backend;
+    unsigned long     flags;
+    u64  dma_offset;
+    u16  len;
+    u8  *buf;
+    u8   hash[32];
+    int  ret;
+
+    /* 原子读取后端指针 */
+    spin_lock_irqsave(&g_backend_lock, flags);
+    backend = g_tpcm_backend;
+    spin_unlock_irqrestore(&g_backend_lock, flags);
+
+    if (!backend) {
+        /* 无后端：走模拟路径，不读 DMA 区 */
+        tpcm_simulate_hash(cmd);
+        return;
+    }
+
+    /* ── 有真实后端：从 DMA 区读数据 ── */
+    writeb(TCM_STATUS_PROCESSING, &cmd->status);
+    dma_offset = readq(&cmd->host_phys_addr);
+    len        = readw(&cmd->payload_len);
+
+    if (!len || len > DMA_SLOT_SIZE || dma_offset + len > A55_SHARED_SIZE) {
+        pr_err("[TPCM] DMA 参数非法: offset=0x%llx len=%u\n",
+               (unsigned long long)dma_offset, len);
+        writeb(TCM_STATUS_ERROR, &cmd->status);
+        return;
+    }
+
+    buf = kmalloc(len, GFP_KERNEL);
+    if (!buf) { writeb(TCM_STATUS_ERROR, &cmd->status); return; }
+
+    /* 从共享内存（WC 映射）拷贝到内核普通内存，再交给后端 */
+    memcpy_fromio(buf, (char __iomem *)dev->shared_base + dma_offset, len);
+
+    pr_info("[TPCM] 调用真实 TPCM: cmd_id=0x%08x len=%u\n",
+            readl(&cmd->cmd_id), len);
+
+    ret = backend(buf, len, hash);   /* ← 调 tpcm_hw.ko 注册的函数 */
+    kfree(buf);
+
+    if (ret == 0) {
+        memcpy_toio(cmd->hash_result32, hash, 32);
+        pr_info("[TPCM] 真实度量完成: cmd_id=0x%08x\n", readl(&cmd->cmd_id));
+    } else {
+        pr_err("[TPCM] 真实度量失败: ret=%d\n", ret);
+        writeb(TCM_STATUS_ERROR, &cmd->status);
+    }
 }
 
 /* =========================================================
@@ -176,8 +267,8 @@ static void tpcm_process_ring(struct a55_tpcm_dev *dev)
             continue;
         }
 
-        /* 执行度量 */
-        tpcm_simulate_hash(cmd);
+        /* 执行度量（有注册后端调真实 TPCM，否则模拟） */
+        tpcm_do_measure(dev, cmd);
 
         /*
          * [关键屏障 2] 写 hash_result 后的写屏障
