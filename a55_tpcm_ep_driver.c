@@ -84,77 +84,101 @@ struct a55_tpcm_dev {
 static struct a55_tpcm_dev *g_tpcm_dev;
 
 /* =========================================================
- * 度量后端回调机制
+ * 度量后端回调机制（拆分为读 / 写两个独立接口）
  *
- * 原理（Linux EXPORT_SYMBOL 插件模式）：
+ * 与 Host 侧 pcie_write_once / pcie_read_once 对应：
  *
- *   本驱动维护一个函数指针 g_tpcm_backend，初始为 NULL。
- *   外部模块（tpcm_hw.ko）在自身 init() 里调用
- *   tpcm_register_backend() 注册真实度量函数；
- *   本驱动在处理每条指令时判断指针是否非 NULL：
- *     非 NULL → 调真实 TPCM（tpcm_hw.ko 提供）
- *     NULL    → 内置模拟（内联在 tpcm_do_measure）
+ *   Host pcie_write_once(data)          A55 tpcm_read_handler(in, in_len)
+ *                                           └─ tpcm_hw.ko 接收并处理数据
  *
- * 这样 tpcm_hw.ko 可以独立编译、独立加载/卸载，
- * 本驱动无需任何修改即可切换真实/模拟两种后端。
+ *   Host pcie_read_once(buf, len)       A55 tpcm_write_handler(out, out_buf_len,
+ *                                                               out_actual_len)
+ *                                           └─ tpcm_hw.ko 将结果填入 out
  *
- * 回调原型：
- *   int fn(const u8 *in,  size_t in_len,
- *          u8  *out, size_t out_buf_len, size_t *out_actual_len)
- *   成功返回 0，并通过 out_actual_len 告知实际写入字节数；
- *   失败返回负数。
+ * 注册规则：
+ *   - 两个处理函数必须同时注册，只注册一个时驱动回退模拟模式并打印警告。
+ *   - 传入 NULL 注销对应处理函数。
+ *
+ * tpcm_read_handler_t 参数：
+ *   in      Host 写入的数据内容
+ *   in_len  数据字节数
+ *
+ * tpcm_write_handler_t 参数：
+ *   out             驱动分配的输出缓冲區（最大 PCIE_DMA_READ_SIZE）
+ *   out_buf_len     缓冲區大小
+ *   out_actual_len  实际写入字节数（实现方必须填写）
+ *   返回 0 表示成功，负数表示失败。
  * ========================================================= */
 
-typedef int (*tpcm_backend_fn_t)(const u8 *in,   size_t in_len,
-                                  u8       *out,  size_t out_buf_len,
-                                  size_t   *out_actual_len);
+/* 读取处理函数：A55 接收 Host 写入的数据 */
+typedef void (*tpcm_read_handler_t)(const u8 *in, size_t in_len);
 
-static tpcm_backend_fn_t g_tpcm_backend;          /* 初始为 NULL，即模拟模式 */
-static DEFINE_SPINLOCK(g_backend_lock);            /* 保护函数指针的并发读写 */
+/* 写回处理函数：A55 将结果填入缓冲，驱动再写回 Host */
+typedef int  (*tpcm_write_handler_t)(u8 *out, size_t out_buf_len,
+                                      size_t *out_actual_len);
+
+static tpcm_read_handler_t  g_read_handler;
+static tpcm_write_handler_t g_write_handler;
+static DEFINE_SPINLOCK(g_handler_lock);
 
 /**
- * tpcm_register_backend() — 注册 / 注销真实 TPCM 度量后端
+ * tpcm_register_read_handler() — 注册 / 注销「读取数据」回调
  *
- * 传入非 NULL 函数指针：注册真实后端，后续度量调真实 TPCM。
- * 传入 NULL：注销后端，回退到内置模拟模式。
- *
- * EXPORT_SYMBOL 使该符号对其他内核模块可见，
- * tpcm_hw.ko 链接时可直接调用，无需修改本文件。
+ * 当 Host 执行 pcie_write_once() 后，驱动调用此回调向 tpcm_hw.ko 展示数据。
+ * 传入 NULL 表示注销。
  */
-void tpcm_register_backend(tpcm_backend_fn_t fn)
+void tpcm_register_read_handler(tpcm_read_handler_t fn)
 {
     unsigned long flags;
-    spin_lock_irqsave(&g_backend_lock, flags);
-    g_tpcm_backend = fn;
-    spin_unlock_irqrestore(&g_backend_lock, flags);
-    pr_info("[TPCM] 度量后端%s\n",
-            fn ? "已注册（真实 TPCM 模式）" : "已注销（回退模拟模式）");
+    spin_lock_irqsave(&g_handler_lock, flags);
+    g_read_handler = fn;
+    spin_unlock_irqrestore(&g_handler_lock, flags);
+    pr_info("[TPCM] 读取处理函数%s\n", fn ? "已注册" : "已注销");
 }
-EXPORT_SYMBOL(tpcm_register_backend);
+EXPORT_SYMBOL(tpcm_register_read_handler);
+
+/**
+ * tpcm_register_write_handler() — 注册 / 注销「写回结果」回调
+ *
+ * 处理完成后，驱动调用此回调得到 tpcm_hw.ko 准备的结果，
+ * 再将其写入 BAR4 读出区供 Host pcie_read_once() 使用。
+ * 传入 NULL 表示注销。
+ */
+void tpcm_register_write_handler(tpcm_write_handler_t fn)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&g_handler_lock, flags);
+    g_write_handler = fn;
+    spin_unlock_irqrestore(&g_handler_lock, flags);
+    pr_info("[TPCM] 写回处理函数%s\n", fn ? "已注册" : "已注销");
+}
+EXPORT_SYMBOL(tpcm_register_write_handler);
 
 /* =========================================================
- * 内置模拟后端已内联至 tpcm_do_measure() 中，此处不再单独声明。
+ * 内置模拟后端已内联至 tpcm_do_measure() 中。
  * ========================================================= */
 
 /* =========================================================
- * 统一度量入口：判断后端 → 调真实 TPCM 或模拟
+ * 统一度量入口：按顺序调用读取和写回处理函数
  * ========================================================= */
 static void tpcm_do_measure(struct a55_tpcm_dev *dev,
                             struct tcm_measure_cmd __iomem *cmd)
 {
-    tpcm_backend_fn_t backend;
-    unsigned long     flags;
+    tpcm_read_handler_t  rh;
+    tpcm_write_handler_t wh;
+    unsigned long        flags;
     u64   w_off, r_off;
     u16   in_len, out_buf_len;
-    u8   *in_buf = NULL;
+    u8   *in_buf  = NULL;
     u8   *out_buf = NULL;
     size_t out_actual = 0;
     int   ret;
 
-    /* 原子读取后端指针 */
-    spin_lock_irqsave(&g_backend_lock, flags);
-    backend = g_tpcm_backend;
-    spin_unlock_irqrestore(&g_backend_lock, flags);
+    /* 原子读取两个处理函数 */
+    spin_lock_irqsave(&g_handler_lock, flags);
+    rh = g_read_handler;
+    wh = g_write_handler;
+    spin_unlock_irqrestore(&g_handler_lock, flags);
 
     writeb(TCM_STATUS_PROCESSING, &cmd->status);
 
@@ -175,28 +199,7 @@ static void tpcm_do_measure(struct a55_tpcm_dev *dev,
         return;
     }
 
-    if (!backend) {
-        /* ── 无真实后端：模拟路径 ──
-         * 从写入区读数据，生成 32 字节模拟哈希写到读出区。
-         */
-        u32  cmd_id = readl(&cmd->cmd_id);
-        u8   hash[32];
-        int  i;
-
-        pr_info("[TPCM] [模拟] cmd_id=0x%08x in_len=%u\n", cmd_id, in_len);
-        msleep(2);
-        for (i = 0; i < 32; i++)
-            hash[i] = (u8)(cmd_id >> ((i % 4) * 8)) ^ (u8)i;
-
-        memcpy_toio((char __iomem *)dev->shared_base + r_off, hash, 32);
-        writel(32, &cmd->read_actual_len);
-
-        pr_info("[TPCM] [模拟] 完成 cmd_id=0x%08x hash[0..3]=%02x%02x%02x%02x\n",
-                cmd_id, hash[0], hash[1], hash[2], hash[3]);
-        return;
-    }
-
-    /* ── 有真实后端：从 DMA 写入区拷贝输入，分配输出缓冲 ── */
+    /* 分配内核缓冲 */
     in_buf  = kmalloc(in_len,      GFP_KERNEL);
     out_buf = kmalloc(out_buf_len, GFP_KERNEL);
     if (!in_buf || !out_buf) {
@@ -206,26 +209,57 @@ static void tpcm_do_measure(struct a55_tpcm_dev *dev,
         return;
     }
 
+    /* 从 BAR4 写入区拷贝输入数据到内核普通内存 */
     memcpy_fromio(in_buf, (char __iomem *)dev->shared_base + w_off, in_len);
 
-    pr_info("[TPCM] 调用真实 TPCM: cmd_id=0x%08x in_len=%u out_buf=%u\n",
-            readl(&cmd->cmd_id), in_len, out_buf_len);
+    if (!rh || !wh) {
+        /* ── 未完整注册：回退内置模拟模式 ── */
+        u32 cmd_id = readl(&cmd->cmd_id);
+        int i;
 
-    ret = backend(in_buf, in_len, out_buf, out_buf_len, &out_actual);
+        if (rh || wh)
+            pr_warn("[TPCM] 读写处理函数未同时注册，回退模拟模式\n");
+        else
+            pr_info("[TPCM] [模拟] cmd_id=0x%08x in_len=%u\n", cmd_id, in_len);
+
+        msleep(2);
+        for (i = 0; i < 32; i++)
+            out_buf[i] = (u8)(cmd_id >> ((i % 4) * 8)) ^ (u8)i;
+        out_actual = 32;
+
+        pr_info("[TPCM] [模拟] 完成 cmd_id=0x%08x hash[0..3]=%02x%02x%02x%02x\n",
+                cmd_id, out_buf[0], out_buf[1], out_buf[2], out_buf[3]);
+        goto write_result;
+    }
+
+    /* ── 正常模式：按顺序调用两个处理函数 ── */
+
+    /* Step 1: 通知 tpcm_hw.ko 读取/处理数据（对应 Host pcie_write_once） */
+    rh(in_buf, in_len);
+
+    /* Step 2: 获取 tpcm_hw.ko 将要写回的结果（对应 Host pcie_read_once） */
+    ret = wh(out_buf, out_buf_len, &out_actual);
+    if (ret != 0) {
+        pr_err("[TPCM] 写回处理失败: ret=%d\n", ret);
+        kfree(in_buf);
+        kfree(out_buf);
+        writeb(TCM_STATUS_ERROR, &cmd->status);
+        return;
+    }
+
+    pr_info("[TPCM] cmd_id=0x%08x in=%u out_actual=%zu\n",
+            readl(&cmd->cmd_id), in_len, out_actual);
+
+write_result:
     kfree(in_buf);
 
-    if (ret == 0 && out_actual > 0) {
-        if (out_actual > out_buf_len)
-            out_actual = out_buf_len;  /* 截断防溢出 */
+    if (out_actual > out_buf_len)
+        out_actual = out_buf_len;    /* 截断防溢出 */
+
+    if (out_actual > 0)
         memcpy_toio((char __iomem *)dev->shared_base + r_off,
                     out_buf, out_actual);
-        writel((u32)out_actual, &cmd->read_actual_len);
-        pr_info("[TPCM] 真实度量完成: cmd_id=0x%08x out=%zu\n",
-                readl(&cmd->cmd_id), out_actual);
-    } else {
-        pr_err("[TPCM] 真实度量失败: ret=%d\n", ret);
-        writeb(TCM_STATUS_ERROR, &cmd->status);
-    }
+    writel((u32)out_actual, &cmd->read_actual_len);
     kfree(out_buf);
 }
 

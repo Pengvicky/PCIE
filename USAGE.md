@@ -343,21 +343,33 @@ pcie_close(fd);
 
 ### 5.1 原理
 
-`a55_tpcm_ep_driver.ko` 导出了一个注册接口：
+与 Host 侧的 `pcie_write_once` / `pcie_read_once` 对应，A55 侧也拆分为**两个独立的回调**：
 
-```c
-/* 回调原型（可变长度输入 + 可变长度输出） */
-typedef int (*tpcm_backend_fn_t)(
-    const u8 *in,   size_t in_len,        /* Host 发来的数据 */
-    u8       *out,  size_t out_buf_len,   /* 结果缓冲区（驱动分配） */
-    size_t   *out_actual_len              /* 实际写入字节数（由实现填写） */
-);
+```
+Host pcie_write_once(data, len)   ──►  A55 tpcm_read_handler(in, in_len)
+                                           └─ tpcm_hw.ko 接收并处理数据
 
-/* 注册 / 注销 */
-void tpcm_register_backend(tpcm_backend_fn_t fn);  /* EXPORT_SYMBOL */
+Host pcie_read_once(buf, len)     ◄──  A55 tpcm_write_handler(out, out_buf_len,
+                                                                out_actual_len)
+                                           └─ tpcm_hw.ko 将结果填入 out
 ```
 
-只需编写一个独立的 `tpcm_hw.ko`，在其 init 中注册真实度量函数即可。
+`a55_tpcm_ep_driver.ko` 导出**两个**注册接口：
+
+```c
+/* 读取处理函数：Host 写入数据后由驱动调用，通知 tpcm_hw.ko 处理数据 */
+typedef void (*tpcm_read_handler_t)(const u8 *in, size_t in_len);
+void tpcm_register_read_handler(tpcm_read_handler_t fn);   /* EXPORT_SYMBOL */
+
+/* 写回处理函数：驱动获取 tpcm_hw.ko 的处理结果，写回 Host 读出区 */
+typedef int (*tpcm_write_handler_t)(u8 *out, size_t out_buf_len,
+                                     size_t *out_actual_len);
+void tpcm_register_write_handler(tpcm_write_handler_t fn); /* EXPORT_SYMBOL */
+```
+
+注册规则：
+- **两个处理函数必须同时注册**，只注册一个时驱动回退到模拟模式并打印警告。
+- 传入 `NULL` 注销对应处理函数。
 
 ### 5.2 实现模板
 
@@ -367,50 +379,85 @@ void tpcm_register_backend(tpcm_backend_fn_t fn);  /* EXPORT_SYMBOL */
 // tpcm_hw.c — 真实 TPCM 后端（填入真实 API 后编译）
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/spinlock.h>
 
-/* a55_tpcm_ep_driver.ko 导出的注册函数 */
-extern void tpcm_register_backend(
-    int (*fn)(const u8 *in,  size_t in_len,
-              u8  *out, size_t out_buf_len, size_t *out_actual_len));
+/* a55_tpcm_ep_driver.ko 导出的两个注册函数 */
+extern void tpcm_register_read_handler(
+    void (*fn)(const u8 *in, size_t in_len));
+extern void tpcm_register_write_handler(
+    int  (*fn)(u8 *out, size_t out_buf_len, size_t *out_actual_len));
 
-/* ★ 替换此函数体为真实 TPCM 调用 ★
+/* 内部暂存处理结果（read_handler 处理完后，write_handler 取走） */
+static u8     g_result[128 * 1024];  /* 最大 128 KB */
+static size_t g_result_len;
+static DEFINE_SPINLOCK(g_result_lock);
+
+/* ★ 读取处理函数：对应 Host pcie_write_once ★
  *
- * in / in_len:          Host 通过 pcie_write_once 发来的数据
- * out / out_buf_len:    驱动分配的输出缓冲（最大 128 KB）
- * out_actual_len:       你的实现必须设置此值 = 实际写入字节数
- *
- * 返回 0 表示成功，负数表示失败（Host 侧收到 PCIE_ERR_HW）。
+ * 驱动检测到 Host 写入数据后调用此函数。
+ * 在此处完成数据处理，并将结果暂存供 write_handler 取走。
  */
-static int my_tpcm_process(const u8 *in,  size_t in_len,
-                            u8       *out, size_t out_buf_len,
-                            size_t   *out_actual_len)
+static void my_on_read(const u8 *in, size_t in_len)
 {
+    size_t out_len = 0;
+    u8     tmp_result[32];  /* 示例：32 字节哈希 */
+    int    ret;
+
+    pr_info("[TPCM_HW] 收到 Host 数据，len=%zu\n", in_len);
+
     /*
-     * 示例：调用 Hi1712 TPCM 内核驱动接口（以实际头文件为准）
-     *
-     *   int ret = tpcm_drv_hash_sha256(in, in_len, out);
-     *   if (ret == 0) *out_actual_len = 32;
-     *   return ret;
-     *
-     * 目前留空，返回 -ENOSYS（Host 侧会收到 PCIE_ERR_HW）。
+     * ★ 替换为真实 TPCM 调用，例如：
+     *   ret = tpcm_drv_hash_sha256(in, in_len, tmp_result);
+     *   if (ret == 0) out_len = 32;
      */
-    (void)in; (void)in_len; (void)out; (void)out_buf_len;
-    *out_actual_len = 0;
-    pr_err("[TPCM_HW] 真实 TPCM 接口未实现，请替换此函数\n");
-    return -ENOSYS;
+    (void)in;
+    ret = -ENOSYS;
+    pr_err("[TPCM_HW] 真实 TPCM 接口未实现\n");
+
+    /* 暂存结果 */
+    spin_lock(&g_result_lock);
+    if (ret == 0 && out_len > 0) {
+        if (out_len > sizeof(g_result))
+            out_len = sizeof(g_result);
+        memcpy(g_result, tmp_result, out_len);
+        g_result_len = out_len;
+    } else {
+        g_result_len = 0;  /* 标记失败 */
+    }
+    spin_unlock(&g_result_lock);
+}
+
+/* ★ 写回处理函数：对应 Host pcie_read_once ★
+ *
+ * 驱动在调用 read_handler 后紧接着调用此函数，
+ * tpcm_hw.ko 把暂存的结果填入 out，驱动再写回 BAR4 读出区。
+ * 返回 0 成功，负数失败（Host 侧收到 PCIE_ERR_HW）。
+ */
+static int my_on_write(u8 *out, size_t out_buf_len, size_t *out_actual_len)
+{
+    spin_lock(&g_result_lock);
+    *out_actual_len = g_result_len;
+    if (g_result_len > 0)
+        memcpy(out, g_result, g_result_len > out_buf_len
+                              ? out_buf_len : g_result_len);
+    spin_unlock(&g_result_lock);
+
+    return (*out_actual_len > 0) ? 0 : -EIO;
 }
 
 static int __init tpcm_hw_init(void)
 {
-    tpcm_register_backend(my_tpcm_process);
-    pr_info("[TPCM_HW] 真实 TPCM 后端已注册\n");
+    tpcm_register_read_handler(my_on_read);
+    tpcm_register_write_handler(my_on_write);
+    pr_info("[TPCM_HW] 读写处理函数已注册\n");
     return 0;
 }
 
 static void __exit tpcm_hw_exit(void)
 {
-    tpcm_register_backend(NULL);  /* 注销，恢复内置模拟模式 */
-    pr_info("[TPCM_HW] 真实 TPCM 后端已注销\n");
+    tpcm_register_read_handler(NULL);
+    tpcm_register_write_handler(NULL);
+    pr_info("[TPCM_HW] 读写处理函数已注销\n");
 }
 
 module_init(tpcm_hw_init);
@@ -447,8 +494,9 @@ rm Kbuild
 
 # 验证日志
 cat /dev/kmsg | grep TPCM
-# 预期：[TPCM_HW] 真实 TPCM 后端已注册
-# 预期：[TPCM] 度量后端已注册（真实 TPCM 模式）
+# 预期：[TPCM_HW] 读写处理函数已注册
+# 预期：[TPCM] 读取处理函数已注册
+# 预期：[TPCM] 写回处理函数已注册
 
 # 卸载顺序（必须先卸 tpcm_hw，再卸基础驱动）
 /sbin/rmmod tpcm_hw
