@@ -93,17 +93,21 @@ static struct a55_tpcm_dev *g_tpcm_dev;
  *   tpcm_register_backend() 注册真实度量函数；
  *   本驱动在处理每条指令时判断指针是否非 NULL：
  *     非 NULL → 调真实 TPCM（tpcm_hw.ko 提供）
- *     NULL    → 调内置模拟（tpcm_simulate_hash）
+ *     NULL    → 内置模拟（内联在 tpcm_do_measure）
  *
  * 这样 tpcm_hw.ko 可以独立编译、独立加载/卸载，
  * 本驱动无需任何修改即可切换真实/模拟两种后端。
  *
  * 回调原型：
- *   int fn(const u8 *data, size_t len, u8 hash_out[32])
- *   成功返回 0，失败返回负数。
+ *   int fn(const u8 *in,  size_t in_len,
+ *          u8  *out, size_t out_buf_len, size_t *out_actual_len)
+ *   成功返回 0，并通过 out_actual_len 告知实际写入字节数；
+ *   失败返回负数。
  * ========================================================= */
 
-typedef int (*tpcm_backend_fn_t)(const u8 *data, size_t len, u8 hash_out[32]);
+typedef int (*tpcm_backend_fn_t)(const u8 *in,   size_t in_len,
+                                  u8       *out,  size_t out_buf_len,
+                                  size_t   *out_actual_len);
 
 static tpcm_backend_fn_t g_tpcm_backend;          /* 初始为 NULL，即模拟模式 */
 static DEFINE_SPINLOCK(g_backend_lock);            /* 保护函数指针的并发读写 */
@@ -129,33 +133,8 @@ void tpcm_register_backend(tpcm_backend_fn_t fn)
 EXPORT_SYMBOL(tpcm_register_backend);
 
 /* =========================================================
- * DMA 数据区布局（与 tpcm_pcie_client.c 中定义一致）
- *   BAR4 偏移 0x10000 起，每槽 256KB，共 128 槽
+ * 内置模拟后端已内联至 tpcm_do_measure() 中，此处不再单独声明。
  * ========================================================= */
-#define DMA_BASE_OFFSET  0x10000UL
-#define DMA_SLOT_SIZE    (256 * 1024UL)
-
-/* =========================================================
- * 内置模拟后端（无真实后端时使用）
- * ========================================================= */
-static void tpcm_simulate_hash(struct tcm_measure_cmd __iomem *cmd)
-{
-    __u32 cmd_id = readl(&cmd->cmd_id);
-    __u8  hash_buf[32];
-    int   i;
-
-    pr_info("[TPCM] [模拟] cmd_id=0x%08x host_phys=0x%016llx len=%u\n",
-            cmd_id,
-            (unsigned long long)readq(&cmd->host_phys_addr),
-            (unsigned int)readw(&cmd->payload_len));
-    writeb(TCM_STATUS_PROCESSING, &cmd->status);
-    msleep(2);
-    for (i = 0; i < 32; i++)
-        hash_buf[i] = ((__u8)(cmd_id >> ((i % 4) * 8))) ^ ((__u8)i);
-    memcpy_toio(cmd->hash_result32, hash_buf, 32);
-    pr_info("[TPCM] [模拟] 完成: cmd_id=0x%08x hash[0..3]=%02x%02x%02x%02x\n",
-            cmd_id, hash_buf[0], hash_buf[1], hash_buf[2], hash_buf[3]);
-}
 
 /* =========================================================
  * 统一度量入口：判断后端 → 调真实 TPCM 或模拟
@@ -165,54 +144,89 @@ static void tpcm_do_measure(struct a55_tpcm_dev *dev,
 {
     tpcm_backend_fn_t backend;
     unsigned long     flags;
-    u64  dma_offset;
-    u16  len;
-    u8  *buf;
-    u8   hash[32];
-    int  ret;
+    u64   w_off, r_off;
+    u16   in_len, out_buf_len;
+    u8   *in_buf = NULL;
+    u8   *out_buf = NULL;
+    size_t out_actual = 0;
+    int   ret;
 
     /* 原子读取后端指针 */
     spin_lock_irqsave(&g_backend_lock, flags);
     backend = g_tpcm_backend;
     spin_unlock_irqrestore(&g_backend_lock, flags);
 
-    if (!backend) {
-        /* 无后端：走模拟路径，不读 DMA 区 */
-        tpcm_simulate_hash(cmd);
-        return;
-    }
-
-    /* ── 有真实后端：从 DMA 区读数据 ── */
     writeb(TCM_STATUS_PROCESSING, &cmd->status);
-    dma_offset = readq(&cmd->host_phys_addr);
-    len        = readw(&cmd->payload_len);
 
-    if (!len || len > DMA_SLOT_SIZE || dma_offset + len > A55_SHARED_SIZE) {
-        pr_err("[TPCM] DMA 参数非法: offset=0x%llx len=%u\n",
-               (unsigned long long)dma_offset, len);
+    w_off       = readq(&cmd->write_data_offset);
+    r_off       = readq(&cmd->read_data_offset);
+    in_len      = readw(&cmd->write_len);
+    out_buf_len = readw(&cmd->read_buf_len);
+
+    /* 参数合法性检查 */
+    if (!in_len || in_len > PCIE_DMA_WRITE_SIZE ||
+        !out_buf_len || out_buf_len > PCIE_DMA_READ_SIZE ||
+        w_off + in_len      > A55_SHARED_SIZE ||
+        r_off + out_buf_len > A55_SHARED_SIZE) {
+        pr_err("[TPCM] 参数非法 w_off=0x%llx in=%u r_off=0x%llx out_buf=%u\n",
+               (unsigned long long)w_off, in_len,
+               (unsigned long long)r_off, out_buf_len);
         writeb(TCM_STATUS_ERROR, &cmd->status);
         return;
     }
 
-    buf = kmalloc(len, GFP_KERNEL);
-    if (!buf) { writeb(TCM_STATUS_ERROR, &cmd->status); return; }
+    if (!backend) {
+        /* ── 无真实后端：模拟路径 ──
+         * 从写入区读数据，生成 32 字节模拟哈希写到读出区。
+         */
+        u32  cmd_id = readl(&cmd->cmd_id);
+        u8   hash[32];
+        int  i;
 
-    /* 从共享内存（WC 映射）拷贝到内核普通内存，再交给后端 */
-    memcpy_fromio(buf, (char __iomem *)dev->shared_base + dma_offset, len);
+        pr_info("[TPCM] [模拟] cmd_id=0x%08x in_len=%u\n", cmd_id, in_len);
+        msleep(2);
+        for (i = 0; i < 32; i++)
+            hash[i] = (u8)(cmd_id >> ((i % 4) * 8)) ^ (u8)i;
 
-    pr_info("[TPCM] 调用真实 TPCM: cmd_id=0x%08x len=%u\n",
-            readl(&cmd->cmd_id), len);
+        memcpy_toio((char __iomem *)dev->shared_base + r_off, hash, 32);
+        writel(32, &cmd->read_actual_len);
 
-    ret = backend(buf, len, hash);   /* ← 调 tpcm_hw.ko 注册的函数 */
-    kfree(buf);
+        pr_info("[TPCM] [模拟] 完成 cmd_id=0x%08x hash[0..3]=%02x%02x%02x%02x\n",
+                cmd_id, hash[0], hash[1], hash[2], hash[3]);
+        return;
+    }
 
-    if (ret == 0) {
-        memcpy_toio(cmd->hash_result32, hash, 32);
-        pr_info("[TPCM] 真实度量完成: cmd_id=0x%08x\n", readl(&cmd->cmd_id));
+    /* ── 有真实后端：从 DMA 写入区拷贝输入，分配输出缓冲 ── */
+    in_buf  = kmalloc(in_len,      GFP_KERNEL);
+    out_buf = kmalloc(out_buf_len, GFP_KERNEL);
+    if (!in_buf || !out_buf) {
+        kfree(in_buf);
+        kfree(out_buf);
+        writeb(TCM_STATUS_ERROR, &cmd->status);
+        return;
+    }
+
+    memcpy_fromio(in_buf, (char __iomem *)dev->shared_base + w_off, in_len);
+
+    pr_info("[TPCM] 调用真实 TPCM: cmd_id=0x%08x in_len=%u out_buf=%u\n",
+            readl(&cmd->cmd_id), in_len, out_buf_len);
+
+    ret = backend(in_buf, in_len, out_buf, out_buf_len, &out_actual);
+    kfree(in_buf);
+
+    if (ret == 0 && out_actual > 0) {
+        if (out_actual > out_buf_len)
+            out_actual = out_buf_len;  /* 截断防溢出 */
+        memcpy_toio((char __iomem *)dev->shared_base + r_off,
+                    out_buf, out_actual);
+        writel((u32)out_actual, &cmd->read_actual_len);
+        pr_info("[TPCM] 真实度量完成: cmd_id=0x%08x out=%zu\n",
+                readl(&cmd->cmd_id), out_actual);
     } else {
         pr_err("[TPCM] 真实度量失败: ret=%d\n", ret);
         writeb(TCM_STATUS_ERROR, &cmd->status);
     }
+    kfree(out_buf);
 }
 
 /* =========================================================

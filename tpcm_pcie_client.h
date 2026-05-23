@@ -1,15 +1,26 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * tpcm_pcie_client.h — Host 侧 TPCM PCIe 度量客户端接口
+ * tpcm_pcie_client.h — Host 侧 PCIe 双向通信客户端接口
  *
- * 业务方只需包含本头文件 + 链接 libtpcm_pcie.so，无需了解
- * PCIe BAR4、ring buffer 等任何底层细节。
+ * 提供两个正交的原语：
+ *   pcie_write_once() — 向 A55 写入一段数据（异步，不等结果）
+ *   pcie_read_once()  — 读取 A55 处理后的结果（阻塞，带超时）
  *
- * 用法示例:
- *   void *h = tpcm_open();
- *   uint8_t hash[32];
- *   tpcm_measure(h, data, len, hash, 5000);
- *   tpcm_close(h);
+ * 典型用法（顺序调用）：
+ *
+ *   int fd = pcie_open();
+ *
+ *   // 写入待处理数据
+ *   ssize_t w = pcie_write_once(fd, data, data_len);
+ *
+ *   // 读取 A55 返回的结果（可变长度）
+ *   uint8_t result[PCIE_MAX_READ_LEN];
+ *   ssize_t r = pcie_read_once(fd, result, sizeof(result));
+ *
+ *   pcie_close(fd);
+ *
+ * 线程安全：同一 fd 不可多线程并发 write/read；
+ *           多线程请各自调用 pcie_open() 获取独立 fd。
  */
 
 #ifndef _TPCM_PCIE_CLIENT_H
@@ -17,94 +28,117 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>  /* ssize_t */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* =========================================================
- * 返回值
+ * 常量（与 tcm_pcie_protocol.h 中的 PCIE_DMA_* 对应）
  * ========================================================= */
-#define TPCM_OK             0
-#define TPCM_ERR_OPEN      -1   /* 设备打开 / mmap 失败 */
-#define TPCM_ERR_PARAM     -2   /* 参数非法（NULL / 超长）*/
-#define TPCM_ERR_FULL      -3   /* ring buffer 已满 */
-#define TPCM_ERR_TIMEOUT   -4   /* 等待度量结果超时 */
-#define TPCM_ERR_HW        -5   /* A55 侧度量硬件错误 */
-#define TPCM_ERR_IO        -6   /* 文件读取失败 */
 
-/* 单次最大度量数据长度：256 KB */
-#define TPCM_MAX_DATA_LEN  (256 * 1024)
+/** 单次最大写入字节数（128 KB） */
+#define PCIE_CLIENT_MAX_WRITE  (128 * 1024)
+
+/** 单次最大读出字节数（128 KB） */
+#define PCIE_CLIENT_MAX_READ   (128 * 1024)
+
+/** 默认超时（毫秒） */
+#define PCIE_DEFAULT_TIMEOUT_MS  5000
+
+/* =========================================================
+ * 错误码（负数，可直接用 pcie_strerror() 转字符串）
+ * ========================================================= */
+#define PCIE_OK            0
+#define PCIE_ERR_OPEN     -1   /* 设备打开 / mmap 失败 */
+#define PCIE_ERR_PARAM    -2   /* 参数非法（NULL / 超长） */
+#define PCIE_ERR_FULL     -3   /* ring buffer 已满，稍后重试 */
+#define PCIE_ERR_TIMEOUT  -4   /* 等待 A55 结果超时 */
+#define PCIE_ERR_HW       -5   /* A55 侧处理返回错误 */
+#define PCIE_ERR_SEQ      -6   /* 调用顺序错误（未先写就读） */
 
 /* =========================================================
  * 生命周期
  * ========================================================= */
 
 /**
- * tpcm_open() — 初始化，打开 /dev/pci_bar4_driver 并 mmap
+ * pcie_open() — 打开 PCIe 通道
  *
- * 返回不透明 handle，失败返回 NULL（errno 已设置）。
- * 线程安全：每个线程应持有独立 handle。
+ * 内部执行：open("/dev/pci_bar4_driver") + mmap BAR4
+ *
+ * 成功返回非负整数 fd（作为后续调用的通道标识）。
+ * 失败返回 -1，errno 已设置。
+ *
+ * 每个 fd 维护独立的发送/接收上下文，多线程请各自 open。
  */
-void *tpcm_open(void);
+int pcie_open(void);
 
 /**
- * tpcm_close() — 释放 handle（munmap + close fd）
+ * pcie_close() — 关闭 PCIe 通道，释放资源
+ *
+ * @fd: pcie_open() 返回的通道标识
  */
-void tpcm_close(void *handle);
+void pcie_close(int fd);
 
 /* =========================================================
- * 度量接口
+ * 核心收发接口
  * ========================================================= */
 
 /**
- * tpcm_measure() — 将一段内存数据发给 A55 TPCM 做 SHA-256 度量
+ * pcie_write_once() — 向 A55 写入一段数据（立即返回，不等结果）
  *
- * @handle:     tpcm_open() 返回的句柄
- * @data:       待度量数据起始地址
- * @len:        数据字节数，不超过 TPCM_MAX_DATA_LEN
- * @hash_out:   输出缓冲区，调用方分配，至少 32 字节
- * @timeout_ms: 等待超时（毫秒），0 使用默认值 5000 ms
+ * @fd:      pcie_open() 返回的通道标识
+ * @buf:     待发送数据首地址
+ * @buf_len: 数据字节数，范围 [1, PCIE_CLIENT_MAX_WRITE]
  *
- * 成功返回 TPCM_OK，并将 32 字节 SHA-256 写入 hash_out。
+ * 成功返回实际写入字节数（== buf_len）。
+ * 失败返回负数错误码：
+ *   PCIE_ERR_PARAM   — buf 为 NULL 或 buf_len 超限
+ *   PCIE_ERR_FULL    — 当前 ring buffer 已满
+ *
+ * 注意：本函数只负责把数据送入 ring buffer 并通知 A55，
+ *       不保证 A55 已处理完毕。需调用 pcie_read_once() 获取结果。
  */
-int tpcm_measure(void       *handle,
-                 const void *data,
-                 size_t      len,
-                 uint8_t     hash_out[32],
-                 int         timeout_ms);
+ssize_t pcie_write_once(int fd, const void *buf, size_t buf_len);
 
 /**
- * tpcm_measure_file() — 对指定路径的文件做整体度量
+ * pcie_read_once() — 读取 A55 处理后的结果
  *
- * @handle:     tpcm_open() 返回的句柄
- * @filepath:   文件绝对路径
- * @hash_out:   输出缓冲区，至少 32 字节
- * @timeout_ms: 等待超时（毫秒），0 使用默认值 5000 ms
+ * @fd:      pcie_open() 返回的通道标识（须已成功调用 pcie_write_once）
+ * @buf:     接收缓冲区首地址
+ * @buf_len: 缓冲区大小（字节），范围 [1, PCIE_CLIENT_MAX_READ]
  *
- * 大文件（> TPCM_MAX_DATA_LEN）会分段哈希后合并。
+ * 阻塞等待 A55 完成，使用 pcie_set_timeout() 设置的超时（默认 5000ms）。
+ *
+ * 成功返回 A55 实际写入的字节数（可能小于 buf_len）。
+ * 失败返回负数错误码：
+ *   PCIE_ERR_SEQ     — 未先调用 pcie_write_once
+ *   PCIE_ERR_TIMEOUT — 超时
+ *   PCIE_ERR_HW      — A55 侧返回错误
  */
-int tpcm_measure_file(void       *handle,
-                      const char *filepath,
-                      uint8_t     hash_out[32],
-                      int         timeout_ms);
+ssize_t pcie_read_once(int fd, void *buf, size_t buf_len);
+
+/* =========================================================
+ * 可选配置
+ * ========================================================= */
+
+/**
+ * pcie_set_timeout() — 设置该通道的读超时（毫秒）
+ *
+ * @fd:         通道标识
+ * @timeout_ms: 毫秒，0 恢复默认值 PCIE_DEFAULT_TIMEOUT_MS
+ */
+void pcie_set_timeout(int fd, int timeout_ms);
 
 /* =========================================================
  * 工具函数
  * ========================================================= */
 
 /**
- * tpcm_hash_to_hex() — 将 32 字节哈希转为 64 字符十六进制串
- *
- * @hash:   32 字节输入
- * @hexbuf: 输出缓冲区，至少 65 字节（含 '\0'）
+ * pcie_strerror() — 将错误码转为可读字符串
  */
-void tpcm_hash_to_hex(const uint8_t hash[32], char hexbuf[65]);
-
-/**
- * tpcm_strerror() — 将错误码转为可读字符串
- */
-const char *tpcm_strerror(int err);
+const char *pcie_strerror(int err);
 
 #ifdef __cplusplus
 }

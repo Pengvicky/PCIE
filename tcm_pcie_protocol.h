@@ -46,6 +46,23 @@
 /* Cache Line 大小（ARM64 / x86_64 均为 64 字节） */
 #define TCM_CACHE_LINE_SIZE         64
 
+/* DMA 数据区布局（BAR4 内）
+ *   具体定义位于 tpcm_pcie_client.c / a55_tpcm_ep_driver.c，
+ *   此处定义公共常量供两侧共用。
+ *
+ *   内存布局：
+ *     [0x000000 ~ 0x002080)  pcie_ring_buffer 控制结构
+ *     [0x010000 ~ ...]       DMA 数据区，每槽 256 KB，前 128 KB 写入，后 128 KB 读出
+ */
+#define PCIE_DMA_BASE_OFFSET        0x10000UL         /* DMA 区起始偏移 */
+#define PCIE_DMA_SLOT_SIZE          (256 * 1024UL)    /* 每槽总大小 */
+#define PCIE_DMA_WRITE_SIZE         (PCIE_DMA_SLOT_SIZE / 2)  /* 每槽写入区 128 KB */
+#define PCIE_DMA_READ_SIZE          (PCIE_DMA_SLOT_SIZE / 2)  /* 每槽读出区 128 KB */
+
+/* 单次最大写入 / 读出数据长度 */
+#define PCIE_MAX_WRITE_LEN          PCIE_DMA_WRITE_SIZE
+#define PCIE_MAX_READ_LEN           PCIE_DMA_READ_SIZE
+
 /* =========================================================
  * 度量指令状态码
  * ========================================================= */
@@ -60,32 +77,33 @@
  * ========================================================= */
 
 /**
- * struct tcm_measure_cmd — 单条度量指令
+ * struct tcm_measure_cmd — 单条度量指令（双向动态长度版）
  *
- * @cmd_id:         流水号，由 Host 侧单调递增，用于匹配请求与响应
- * @status:         指令状态，见 TCM_STATUS_* 宏
- * @payload_len:    待度量数据的字节长度
- * @reserved:       对齐填充，保留供后续扩展
- * @host_phys_addr: Host 侧待度量数据的物理地址（A55 通过 DMA 读取）
- * @hash_result32:  A55 计算完成后回填的 32 字节哈希结果（SHA-256）
+ * Host 处填写字段：
+ *   cmd_id / status / write_len / read_buf_len /
+ *   write_data_offset / read_data_offset
  *
- * 整体大小：4+1+1+2+8+32 = 48 字节，不足 64 字节 Cache Line，
- * 由编译器自然对齐；Ring Buffer 数组本身按 Cache Line 对齐。
+ * A55 回填字段：
+ *   read_actual_len（实际写入结果的字节数）
+ *   status → TCM_STATUS_DONE / TCM_STATUS_ERROR
+ *
+ * DMA 布局（每个槽位对应 PCIE_DMA_SLOT_SIZE）：
+ *   write_data_offset = PCIE_DMA_BASE_OFFSET + slot * PCIE_DMA_SLOT_SIZE
+ *   read_data_offset  = write_data_offset + PCIE_DMA_WRITE_SIZE
+ *
+ * 整体大小：恰好 64 字节，独占一条 Cache Line。
  */
 struct tcm_measure_cmd {
-    __u32   cmd_id;                 /* 指令流水号 */
-    __u8    status;                 /* 状态码 */
-    __u8    payload_len_hi;         /* payload_len 高 8 位（大端兼容） */
-    __u16   payload_len;            /* 待度量数据长度（字节，低 16 位） */
-    __u64   host_phys_addr;         /* Host 侧数据物理地址 */
-    __u8    hash_result32[32];      /* SHA-256 哈希结果（A55 回填） */
-    __u8    _pad[12];               /* 填充至 64 字节，独占一条 Cache Line */
+    __u32   cmd_id;                 /* 指令流水号（Host 单调递增） */
+    __u8    status;                 /* 状态码，见 TCM_STATUS_* */
+    __u8    _pad0[3];               /* 对齐填充 */
+    __u16   write_len;              /* Host 写入数据的字节数 */
+    __u16   read_buf_len;           /* Host 为读出结果分配的缓冲大小 */
+    __u32   read_actual_len;        /* A55 实际写入结果的字节数（A55 回填）*/
+    __u64   write_data_offset;      /* BAR4 内写入数据起始偏移 */
+    __u64   read_data_offset;       /* BAR4 内读出结果起始偏移 */
+    __u8    _pad1[28];              /* 填充至 64 字节 */
 } __attribute__((packed, aligned(TCM_CACHE_LINE_SIZE)));
-
-/* 编译期断言：确保结构体恰好 64 字节 */
-#define TCM_MEASURE_CMD_SIZE_CHECK \
-    _Static_assert(sizeof(struct tcm_measure_cmd) == 64, \
-        "tcm_measure_cmd must be exactly 64 bytes (one cache line)")
 
 /**
  * struct pcie_ring_buffer — 无锁环形缓冲区控制块

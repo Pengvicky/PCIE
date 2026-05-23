@@ -16,20 +16,21 @@
 Kunpeng 950 (Host / PCIe RC)          Hi1712 A55 BMC (PCIe EP)
 ─────────────────────────────          ────────────────────────────────
 业务程序                                 tpcm_hw.ko（待实现，可选）
-  │  tpcm_measure(data, len, hash)         │  tpcm_register_backend(fn)
-  ▼                                        ▼
-libtpcm_pcie.so                        a55_tpcm_ep_driver.ko
-  │  写 DMA 数据 + ring head               │  kthread 每 200µs 轮询
-  ▼                                        │  tpcm_do_measure()
-pci_bar4_driver.ko                         │    ├── 有后端 → 调真实 TPCM
-  │  mmap /dev/pci_bar4_driver             │    └── 无后端 → 模拟哈希
-  │                                        │
-  │        ← PCIe BAR4 共享内存 →          │
-  └─────────── 0x800000000000 ────────────┘
+  │  pcie_write_once(fd, data, len)        │  tpcm_register_backend(fn)
+  │  pcie_read_once (fd, buf,  len)        ▼
+  ▼                                   a55_tpcm_ep_driver.ko
+libpcie_client.so                       │  kthread 每 200µs 轮询
+  │  写 DMA 数据 + ring head             │  tpcm_do_measure()
+  ▼                                      │    ├── 有后端 → 调真实 TPCM
+pci_bar4_driver.ko                       │    └── 无后端 → 模拟（32B 哈希）
+  │  mmap /dev/pci_bar4_driver           │
+  │                                      │
+  │        ← PCIe BAR4 共享内存 →        │
+  └─────────── 0x800000000000 ──────────┘
               A55 物理地址 0x8bc00000
 ```
 
-### 共享内存布局（BAR4，32MB）
+### 共享内存布局（BAR4，32 MB）
 
 | 偏移 | 大小 | 用途 |
 |------|------|------|
@@ -37,6 +38,14 @@ pci_bar4_driver.ko                         │    ├── 有后端 → 调真
 | `0x000040` | 64 B | ring buffer tail（独占 cache line） |
 | `0x000080` | 8 KB | cmds[128]，每条指令 64 字节 |
 | `0x010000` | 32 MB | DMA 数据区，128 槽 × 256 KB |
+
+### DMA 槽位布局（每槽 256 KB）
+
+```
+slot N 起始偏移 = 0x10000 + N × 256KB
+  ├── [+0 KB  ~ +128 KB)  写入区：Host → A55（pcie_write_once 数据）
+  └── [+128 KB ~ +256 KB) 读出区：A55 → Host（pcie_read_once 结果）
+```
 
 ---
 
@@ -54,8 +63,8 @@ make all
 make producer
 
 # 编译共享库（业务方接入用）
-make lib          # 生成 libtpcm_pcie.so
-make lib-static   # 生成 libtpcm_pcie.a（可选，嵌入可执行文件）
+make lib          # 生成 libpcie_client.so
+make lib-static   # 生成 libpcie_client.a（可选，嵌入可执行文件）
 ```
 
 ### 2.2 A55 侧（在 WSL 交叉编译环境中执行）
@@ -67,7 +76,12 @@ make lib-static   # 生成 libtpcm_pcie.a（可选，嵌入可执行文件）
 /opt/hcc_arm64le-bmc/bin/aarch64-target-linux-gnu-gcc --version
 
 # 把源码传到 WSL（.c 文件被内网拦截时，用 base64 绕过）
-
+# 在 950 上执行：
+base64 a55_tpcm_ep_driver.c > /tmp/drv.b64
+base64 tcm_pcie_protocol.h  > /tmp/proto.b64
+# 在 WSL 中还原：
+base64 -d /tmp/drv.b64   > a55_tpcm_ep_driver.c
+base64 -d /tmp/proto.b64 > tcm_pcie_protocol.h
 
 # 交叉编译（在 WSL 中执行）
 export PATH=/opt/hcc_arm64le/bin:$PATH
@@ -153,133 +167,178 @@ echo 500 > /sys/module/a55_tpcm_ep_driver/parameters/poll_interval_us
 ```bash
 gcc -O2 -o myapp myapp.c \
     -I/path/to/PCIE \
-    -L/path/to/PCIE -ltpcm_pcie \
+    -L/path/to/PCIE -lpcie_client \
     -Wl,-rpath,/path/to/PCIE
 ```
 
 ### 4.2 接口说明
 
-#### `tpcm_open()` — 初始化
+#### 生命周期
+
+##### `pcie_open()` — 打开通道
 
 ```c
-void *tpcm_open(void);
+int pcie_open(void);
 ```
 
 - 打开 `/dev/pci_bar4_driver` 并 mmap BAR4 共享内存
-- **返回**：成功返回不透明 handle，失败返回 `NULL`（errno 已设置）
-- 线程安全：每个线程应持有独立 handle
+- **返回**：成功返回非负整数 `fd`，失败返回 `-1`（errno 已设置）
+- 线程安全：每个线程应调用 `pcie_open()` 持有独立 `fd`，最多 16 个并发通道
 
-#### `tpcm_close()` — 释放
+##### `pcie_close()` — 关闭通道
 
 ```c
-void tpcm_close(void *handle);
+void pcie_close(int fd);
 ```
 
-- munmap + close fd，释放所有资源
+- munmap + close，释放所有资源
 
-#### `tpcm_measure()` — 内存数据度量
+##### `pcie_set_timeout()` — 设置读超时
 
 ```c
-int tpcm_measure(void       *handle,
-                 const void *data,
-                 size_t      len,
-                 uint8_t     hash_out[32],
-                 int         timeout_ms);
+void pcie_set_timeout(int fd, int timeout_ms);
+```
+
+- 传 `0` 恢复默认值（5000 ms）
+
+---
+
+#### 核心收发接口
+
+##### `pcie_write_once()` — 发送数据
+
+```c
+ssize_t pcie_write_once(int fd, const void *buf, size_t buf_len);
 ```
 
 | 参数 | 说明 |
 |------|------|
-| `handle` | `tpcm_open()` 返回的句柄 |
-| `data` | 待度量数据起始地址 |
-| `len` | 数据字节数，≤ 256 KB（`TPCM_MAX_DATA_LEN`） |
-| `hash_out` | 输出缓冲区，调用方分配，至少 32 字节 |
-| `timeout_ms` | 超时（毫秒），传 0 使用默认值 5000 ms |
+| `fd` | `pcie_open()` 返回的通道标识 |
+| `buf` | 待发送数据首地址 |
+| `buf_len` | 字节数，范围 `[1, 131072]`（128 KB = `PCIE_CLIENT_MAX_WRITE`） |
 
-**返回值**：`TPCM_OK(0)` 成功，负数为错误码（见下表）
+- **立即返回**，不等 A55 处理完毕
+- 成功返回实际写入字节数（= `buf_len`）
+- 失败返回负数错误码
 
-#### `tpcm_measure_file()` — 文件度量
+##### `pcie_read_once()` — 读取结果
 
 ```c
-int tpcm_measure_file(void       *handle,
-                      const char *filepath,
-                      uint8_t     hash_out[32],
-                      int         timeout_ms);
+ssize_t pcie_read_once(int fd, void *buf, size_t buf_len);
 ```
 
-- 自动读取文件内容并度量
-- 大文件（> 256 KB）按段度量，取最后段哈希（生产环境可改为 Merkle 树）
+| 参数 | 说明 |
+|------|------|
+| `fd` | 通道标识（须已成功调用 `pcie_write_once`） |
+| `buf` | 接收缓冲区首地址 |
+| `buf_len` | 缓冲区大小，范围 `[1, 131072]`（128 KB = `PCIE_CLIENT_MAX_READ`） |
+
+- **阻塞**直到 A55 完成或超时
+- 成功返回 A55 实际写入的字节数（**可变长度**，可能小于 `buf_len`）
+- 失败返回负数错误码
+
+> **调用约束**：`pcie_write_once` → `pcie_read_once` 必须成对顺序调用，
+> 不能连续调两次 `write_once` 再调 `read_once`。
+
+---
 
 #### 错误码
 
 | 常量 | 值 | 含义 |
 |------|----|------|
-| `TPCM_OK` | 0 | 成功 |
-| `TPCM_ERR_OPEN` | -1 | 设备打开 / mmap 失败 |
-| `TPCM_ERR_PARAM` | -2 | 参数非法 |
-| `TPCM_ERR_FULL` | -3 | ring buffer 已满（128 条指令堆积） |
-| `TPCM_ERR_TIMEOUT` | -4 | A55 未在超时内完成度量 |
-| `TPCM_ERR_HW` | -5 | A55 硬件度量失败 |
-| `TPCM_ERR_IO` | -6 | 文件读取失败 |
-
-#### 工具函数
+| `PCIE_OK` | 0 | 成功 |
+| `PCIE_ERR_OPEN` | -1 | 设备打开 / mmap 失败 |
+| `PCIE_ERR_PARAM` | -2 | 参数非法（NULL / 超长） |
+| `PCIE_ERR_FULL` | -3 | ring buffer 已满（128 条指令堆积） |
+| `PCIE_ERR_TIMEOUT` | -4 | A55 未在超时内完成处理 |
+| `PCIE_ERR_HW` | -5 | A55 侧处理失败 |
+| `PCIE_ERR_SEQ` | -6 | 未先调用 `pcie_write_once` 就调用了 `pcie_read_once` |
 
 ```c
-// 32 字节哈希 → 64 字符十六进制字符串
-void tpcm_hash_to_hex(const uint8_t hash[32], char hexbuf[65]);
-
-// 错误码 → 可读字符串
-const char *tpcm_strerror(int err);
+const char *pcie_strerror(int err);   // 错误码 → 可读字符串
 ```
+
+---
 
 ### 4.3 完整使用示例
 
 ```c
 #include <stdio.h>
+#include <string.h>
 #include "tpcm_pcie_client.h"
 
 int main(void)
 {
-    uint8_t hash[32];
-    char    hexstr[65];
-    int     ret;
+    uint8_t result[PCIE_CLIENT_MAX_READ];
+    ssize_t n;
+    int     fd;
 
-    /* 1. 初始化 */
-    void *h = tpcm_open();
-    if (!h) {
-        perror("tpcm_open");
+    /* 1. 打开通道 */
+    fd = pcie_open();
+    if (fd < 0) {
+        perror("pcie_open");
         return 1;
     }
 
-    /* 2a. 对一段内存做度量 */
-    const char *msg = "Hello TPCM";
-    ret = tpcm_measure(h, msg, strlen(msg), hash, 5000);
-    if (ret == TPCM_OK) {
-        tpcm_hash_to_hex(hash, hexstr);
-        printf("内存度量结果: %s\n", hexstr);
-    } else {
-        fprintf(stderr, "度量失败: %s\n", tpcm_strerror(ret));
-    }
+    /* 可选：设置超时 10 秒 */
+    pcie_set_timeout(fd, 10000);
 
-    /* 2b. 对文件做度量 */
-    ret = tpcm_measure_file(h, "/boot/vmlinuz", hash, 10000);
-    if (ret == TPCM_OK) {
-        tpcm_hash_to_hex(hash, hexstr);
-        printf("文件度量结果: %s\n", hexstr);
-    } else {
-        fprintf(stderr, "文件度量失败: %s\n", tpcm_strerror(ret));
+    /* 2. 发送待处理数据 */
+    const char *payload = "Hello TPCM";
+    n = pcie_write_once(fd, payload, strlen(payload));
+    if (n < 0) {
+        fprintf(stderr, "write 失败: %s\n", pcie_strerror((int)n));
+        pcie_close(fd);
+        return 1;
     }
+    printf("已发送 %zd 字节\n", n);
 
-    /* 3. 释放 */
-    tpcm_close(h);
-    return ret;
+    /* 3. 读取 A55 返回的结果（可变长度） */
+    n = pcie_read_once(fd, result, sizeof(result));
+    if (n < 0) {
+        fprintf(stderr, "read 失败: %s\n", pcie_strerror((int)n));
+        pcie_close(fd);
+        return 1;
+    }
+    printf("收到 A55 结果 %zd 字节\n", n);
+
+    /* 4. 打印结果（以十六进制示例） */
+    for (ssize_t i = 0; i < n; i++)
+        printf("%02x", result[i]);
+    printf("\n");
+
+    /* 5. 关闭通道 */
+    pcie_close(fd);
+    return 0;
 }
+```
+
+### 4.4 多次交互示例
+
+```c
+int fd = pcie_open();
+
+for (int i = 0; i < 10; i++) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "request-%d", i);
+
+    /* 每次 write_once 后必须紧跟一次 read_once */
+    pcie_write_once(fd, msg, strlen(msg));
+
+    uint8_t resp[PCIE_CLIENT_MAX_READ];
+    ssize_t n = pcie_read_once(fd, resp, sizeof(resp));
+    if (n > 0)
+        printf("[%d] A55 返回 %zd 字节\n", i, n);
+}
+
+pcie_close(fd);
 ```
 
 ---
 
 ## 5. A55 侧替换真实 TPCM 接口
 
-> **当前状态**：驱动内置模拟后端，可正常运行。  
+> **当前状态**：驱动内置模拟后端，可正常运行（返回 32 字节模拟哈希）。  
 > 获取到真实 TPCM 内核 API 后，按本节步骤替换，**无需修改 `a55_tpcm_ep_driver.c`**。
 
 ### 5.1 原理
@@ -287,11 +346,15 @@ int main(void)
 `a55_tpcm_ep_driver.ko` 导出了一个注册接口：
 
 ```c
-// 回调原型
-typedef int (*tpcm_backend_fn_t)(const u8 *data, size_t len, u8 hash_out[32]);
+/* 回调原型（可变长度输入 + 可变长度输出） */
+typedef int (*tpcm_backend_fn_t)(
+    const u8 *in,   size_t in_len,        /* Host 发来的数据 */
+    u8       *out,  size_t out_buf_len,   /* 结果缓冲区（驱动分配） */
+    size_t   *out_actual_len              /* 实际写入字节数（由实现填写） */
+);
 
-// 注册 / 注销
-void tpcm_register_backend(tpcm_backend_fn_t fn);  // EXPORT_SYMBOL
+/* 注册 / 注销 */
+void tpcm_register_backend(tpcm_backend_fn_t fn);  /* EXPORT_SYMBOL */
 ```
 
 只需编写一个独立的 `tpcm_hw.ko`，在其 init 中注册真实度量函数即可。
@@ -307,35 +370,46 @@ void tpcm_register_backend(tpcm_backend_fn_t fn);  // EXPORT_SYMBOL
 
 /* a55_tpcm_ep_driver.ko 导出的注册函数 */
 extern void tpcm_register_backend(
-    int (*fn)(const u8 *data, size_t len, u8 hash_out[32]));
+    int (*fn)(const u8 *in,  size_t in_len,
+              u8  *out, size_t out_buf_len, size_t *out_actual_len));
 
-/* ★ 替换此函数体为真实 TPCM 调用 ★ */
-static int my_tpcm_sha256(const u8 *data, size_t len, u8 hash_out[32])
+/* ★ 替换此函数体为真实 TPCM 调用 ★
+ *
+ * in / in_len:          Host 通过 pcie_write_once 发来的数据
+ * out / out_buf_len:    驱动分配的输出缓冲（最大 128 KB）
+ * out_actual_len:       你的实现必须设置此值 = 实际写入字节数
+ *
+ * 返回 0 表示成功，负数表示失败（Host 侧收到 PCIE_ERR_HW）。
+ */
+static int my_tpcm_process(const u8 *in,  size_t in_len,
+                            u8       *out, size_t out_buf_len,
+                            size_t   *out_actual_len)
 {
     /*
-     * 示例：调用 Hi1712 TPCM 内核驱动导出的 SHA-256 接口
+     * 示例：调用 Hi1712 TPCM 内核驱动接口（以实际头文件为准）
      *
-     * 可能的接口形式（以实际头文件为准）：
-     *   return tpcm_drv_hash_sha256(data, len, hash_out);
-     *   return tpcm_extend_pcr(0, data, len, hash_out);
+     *   int ret = tpcm_drv_hash_sha256(in, in_len, out);
+     *   if (ret == 0) *out_actual_len = 32;
+     *   return ret;
      *
-     * 确认 TPCM 驱动接口后填入，目前留空返回 -ENOSYS。
+     * 目前留空，返回 -ENOSYS（Host 侧会收到 PCIE_ERR_HW）。
      */
-    (void)data; (void)len; (void)hash_out;
+    (void)in; (void)in_len; (void)out; (void)out_buf_len;
+    *out_actual_len = 0;
     pr_err("[TPCM_HW] 真实 TPCM 接口未实现，请替换此函数\n");
     return -ENOSYS;
 }
 
 static int __init tpcm_hw_init(void)
 {
-    tpcm_register_backend(my_tpcm_sha256);
+    tpcm_register_backend(my_tpcm_process);
     pr_info("[TPCM_HW] 真实 TPCM 后端已注册\n");
     return 0;
 }
 
 static void __exit tpcm_hw_exit(void)
 {
-    tpcm_register_backend(NULL);  /* 注销，恢复模拟模式 */
+    tpcm_register_backend(NULL);  /* 注销，恢复内置模拟模式 */
     pr_info("[TPCM_HW] 真实 TPCM 后端已注销\n");
 }
 
@@ -347,35 +421,38 @@ MODULE_DESCRIPTION("Hi1712 TPCM 真实度量后端");
 
 ### 5.3 编译 tpcm_hw.ko
 
-在 `Makefile.a55` 旁边新建 `Kbuild.hw`（或直接复用 `Makefile.a55`）：
-
 ```bash
-# 与 a55_tpcm_ep_driver.ko 同环境编译
 export PATH=/opt/hcc_arm64le/bin:$PATH
 
 # 先编译 a55_tpcm_ep_driver.ko，生成 Module.symvers（含导出符号）
 make -f Makefile.a55 ARCH=arm64 CROSS_COMPILE=aarch64-target-linux-gnu- \
-  KDIR=/opt/RTOS/208.11.0/arm64le_5.10_ek_preempt_pro
+  KDIR=/opt/RTOS-bmc/208.11.0/arm64le_5.10_ek_preempt_pro
 
 # 编译 tpcm_hw.ko（需要 Module.symvers 解析 tpcm_register_backend）
 echo "obj-m := tpcm_hw.o" > Kbuild
-make -C /opt/RTOS/208.11.0/arm64le_5.10_ek_preempt_pro \
+make -C /opt/RTOS-bmc/208.11.0/arm64le_5.10_ek_preempt_pro \
   M=$(pwd) ARCH=arm64 CROSS_COMPILE=aarch64-target-linux-gnu- \
   KBUILD_EXTRA_SYMBOLS=$(pwd)/Module.symvers modules
 rm Kbuild
+
+# 产物：tpcm_hw.ko
 ```
 
 ### 5.4 加载顺序
 
 ```bash
-# A55 上按顺序加载
-/sbin/insmod /tmp/a55_tpcm_ep_driver.ko   # 先加载基础驱动
+# A55 上按顺序加载（顺序不能反）
+/sbin/insmod /tmp/a55_tpcm_ep_driver.ko   # 先加载基础驱动（导出注册符号）
 /sbin/insmod /tmp/tpcm_hw.ko              # 后加载后端（自动注册）
 
 # 验证日志
 cat /dev/kmsg | grep TPCM
 # 预期：[TPCM_HW] 真实 TPCM 后端已注册
-# 预期：[TPCM] 度量后端已注册（真实 TPCM）
+# 预期：[TPCM] 度量后端已注册（真实 TPCM 模式）
+
+# 卸载顺序（必须先卸 tpcm_hw，再卸基础驱动）
+/sbin/rmmod tpcm_hw
+/sbin/rmmod a55_tpcm_ep_driver
 ```
 
 ---
@@ -385,9 +462,11 @@ cat /dev/kmsg | grep TPCM
 | 现象 | 原因 | 解决 |
 |------|------|------|
 | `insmod: invalid module format` | .ko 与运行内核版本不匹配 | 用 Hi1712 5.10.0 内核源码重新交叉编译 |
-| `tpcm_open()` 返回 NULL | `/dev/pci_bar4_driver` 不存在 | 先在 950 上加载 `pci_bar4_driver.ko` |
-| `TPCM_ERR_TIMEOUT` | A55 驱动未加载或处理慢 | 检查 A55 上 `cat /proc/modules \| grep tpcm` |
-| `TPCM_ERR_FULL` | ring buffer 满（128 条积压） | 等 A55 消费后重试，或加大超时 |
+| `pcie_open()` 返回 `-1` | `/dev/pci_bar4_driver` 不存在 | 先在 950 上加载 `pci_bar4_driver.ko` |
+| `PCIE_ERR_TIMEOUT` | A55 驱动未加载或处理慢 | 检查 A55 上 `cat /proc/modules \| grep tpcm` |
+| `PCIE_ERR_FULL` | ring buffer 满（128 条积压） | 等 A55 消费后重试，或加大超时 |
+| `PCIE_ERR_SEQ` | 未先 write 就调了 read | 确保每次 `write_once` 后紧跟 `read_once` |
+| `pcie_read_once` 返回 0 | A55 完成但未写入结果 | 检查 A55 侧后端实现是否正确设置 `out_actual_len` |
 | A55 日志无输出 | dmesg 权限不足 | 用 `cat /dev/kmsg` 代替 dmesg |
 | 编译报 `arch//Makefile not found` | ARCH 参数为空 | 显式传 `ARCH=arm64` |
 | 编译报 `No rule to make target *.o` | .c 源文件缺失 | 用 base64 绕过内网将 .c 文件传入 |
