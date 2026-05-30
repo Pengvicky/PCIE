@@ -9,6 +9,8 @@
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
+#include <linux/version.h>
+#include <linux/mm.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("PCI Driver Developer");
@@ -291,6 +293,41 @@ const char __user *buf, size_t count, loff_t *ppos)
     return count;
 }
 
+// mmap function for mapping BAR4 into user space
+static int pci_bar4_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    unsigned long requested_size = vma->vm_end - vma->vm_start;
+    unsigned long pfn = bar4_start >> PAGE_SHIFT;
+
+    if (!bar4_start || !bar4_size) {
+        printk(KERN_ERR "BAR4 resource is not initialized\n");
+        return -ENODEV;
+    }
+
+    if (requested_size > bar4_size) {
+        printk(KERN_ERR "mmap size too large: requested=%lu, bar4_size=%lu\n",
+               requested_size, bar4_size);
+        return -EINVAL;
+    }
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+#else
+    vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
+    vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+    if (remap_pfn_range(vma, vma->vm_start, pfn,
+                        requested_size, vma->vm_page_prot)) {
+        printk(KERN_ERR "remap_pfn_range failed\n");
+        return -EAGAIN;
+    }
+
+    printk(KERN_INFO "BAR4 mmap success: phys=0x%lx, size=%lu\n",
+           bar4_start, requested_size);
+    return 0;
+}
+
 // File operations structure
 static const struct file_operations fops = {
     .owner = THIS_MODULE,
@@ -299,6 +336,7 @@ static const struct file_operations fops = {
     .read = pci_bar4_read_func,
     .write = pci_bar4_write_func,
     .unlocked_ioctl = pci_bar4_ioctl,
+    .mmap = pci_bar4_mmap,
     .llseek = default_llseek,
 };
 
@@ -376,7 +414,12 @@ static int __init pci_bar4_init(void)
     }
 
     // 7. Create device class
+    // class_create() dropped the 'owner' argument in kernel 6.4
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+    pci_bar4_class = class_create(DEVICE_NAME);
+#else
     pci_bar4_class = class_create(THIS_MODULE, DEVICE_NAME);
+#endif
     if (IS_ERR(pci_bar4_class)) {
         printk(KERN_ERR "Failed to create device class\n");
         ret = PTR_ERR(pci_bar4_class);
